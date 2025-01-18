@@ -11,33 +11,25 @@ import google.generativeai as genai
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from urllib.parse import urljoin, urlparse
+from numpy import conj
 import streamlit as st
 from streamlit_chat import message
 import time
 import nest_asyncio
+import ssl
 
-# Enable nested async loops (needed for Streamlit)
+
 nest_asyncio.apply()
-
-# Load environment variables
 load_dotenv()
-
-# Verify environment variables
-print("\nChecking environment variables:")
-print(f"GOOGLE_API_KEY set: {'GOOGLE_API_KEY' in os.environ}")
-print(f"COHERE_API_KEY set: {'COHERE_API_KEY' in os.environ}")
 
 @dataclass
 class WebContent:
     """Represents crawled web content."""
-    title: str
-    content: str
-    url: str
-    source_quality: float
+    title: str | None
+    content: str | None
+    url: str | None
+    source_quality: float | None
 
-# WebCrawler class remains the same...
-#
-#
 class WebCrawler:
     """Handles web crawling functionality with educational focus."""
 
@@ -52,12 +44,24 @@ class WebCrawler:
             'nationalgeographic.com': 0.85,
             'sciencedaily.com': 0.8,
             'education.com': 0.75,
-            'scholastic.com': 0.85
+            'scholastic.com': 0.85,
         }
+        # Create a custom SSL context
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        # Increased timeout and added retry configuration
         self.session = httpx.AsyncClient(
-            timeout=10.0,
+            timeout=30.0,  # Increased timeout
             follow_redirects=True,
-            headers={'User-Agent': 'Educational Content Bot 1.0'}
+            verify=ssl_context,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            },
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
         )
         print(f"Initialized with {len(self.trusted_domains)} trusted domains")
 
@@ -85,71 +89,120 @@ class WebCrawler:
     async def crawl_url(self, url: str) -> Optional[WebContent]:
         """Crawl a single URL and extract content."""
         print(f"\nCrawling URL: {url}")
-        try:
-            response = await self.session.get(url)
-            response.raise_for_status()
-            print(f"Successfully fetched {url}")
+        retries = 3
 
-            soup = BeautifulSoup(response.text, 'html.parser')
-            title = soup.title.string if soup.title else url
-            content = await self.clean_text(soup)
+        for attempt in range(retries):
+            try:
+                response = await asyncio.wait_for(
+                    self.session.get(url),
+                    timeout=30
+                )
+                response.raise_for_status()
+                print(f"Successfully fetched {url}")
 
-            if not content:
-                print(f"No content found for {url}")
-                return None
+                soup = BeautifulSoup(response.text, 'html.parser')
+                title = soup.title.string if soup.title else url
+                content = await self.clean_text(soup)
 
-            result = WebContent(
-                title=title,
-                content=content[:2000],  # Limit content length
-                url=url,
-                source_quality=self.get_domain_score(url)
-            )
-            print(f"Successfully extracted content from {url} (quality: {result.source_quality})")
-            return result
+                if not content:
+                    print(f"No content found for {url}")
+                    return None
 
-        except Exception as e:
-            print(f"Error crawling {url}: {str(e)}")
-            print(f"Full exception: {repr(e)}")
-            return None
+                result = WebContent(
+                    title=title,
+                    content=content[:2000],  # Limit content length
+                    url=url,
+                    source_quality=self.get_domain_score(url)
+                )
+                print(f"Successfully extracted content from {url} (quality: {result.source_quality})")
+                return result
+
+            except asyncio.TimeoutError:
+                print(f"Timeout on attempt {attempt + 1} for {url}")
+                if attempt == retries - 1:
+                    print(f"All retries failed for {url}")
+                    return None
+                await asyncio.sleep(1)  # Wait before retrying
+
+            except Exception as e:
+                print(f"Error crawling {url} on attempt {attempt + 1}: {str(e)}")
+                if attempt == retries - 1:
+                    print(f"All retries failed for {url}")
+                    return None
+                await asyncio.sleep(1)
 
     async def search(self, query: str, num_results: int = 3) -> List[WebContent]:
         """Perform web search using DuckDuckGo and crawl results."""
         print(f"\nStarting web search for query: {query}")
-        search_url = f"https://html.duckduckgo.com/html/?q={query}+site:({'+OR+'.join(self.trusted_domains.keys())})"
 
-        try:
-            print(f"Sending request to DuckDuckGo")
-            response = await self.session.get(search_url)
-            response.raise_for_status()
-            print("Successfully received search results")
+        # Using a more reliable search URL format
+        search_url = (
+            "https://duckduckgo.com/html/?" +
+            f"q={query}+site:({'+OR+'.join(self.trusted_domains.keys())})" +
+            "&kl=us-en&kt=n"
+        )
 
-            soup = BeautifulSoup(response.text, 'html.parser')
-            result_links = []
+        retries = 3
+        for attempt in range(retries):
+            try:
+                print(f"Sending request to DuckDuckGo (attempt {attempt + 1})")
+                response = await asyncio.wait_for(
+                    self.session.get(
+                        search_url,
+                        headers={'Cache-Control': 'no-cache'}
+                    ),
+                    timeout=30
+                )
+                response.raise_for_status()
+                print("Successfully received search results")
 
-            for result in soup.find_all('a', class_='result__url'):
-                url = result.get('href')
-                if url:
-                    full_url = urljoin('https://', url)
-                    print(f"Found result URL: {full_url}")
-                    result_links.append(full_url)
-                if len(result_links) >= num_results:
-                    break
+                soup = BeautifulSoup(response.text, 'html.parser')
+                result_links = []
 
-            print(f"Found {len(result_links)} result links")
+                # Updated selector for DuckDuckGo results
+                for result in soup.select('.result__url, .result__a'):
+                    url = result.get('href')
+                    if url:
+                        full_url = urljoin('https://', url)
+                        if any(domain in full_url for domain in self.trusted_domains):
+                            print(f"Found result URL: {full_url}")
+                            result_links.append(full_url)
+                    if len(result_links) >= num_results:
+                        break
 
-            tasks = [self.crawl_url(url) for url in result_links]
-            results = await asyncio.gather(*tasks)
+                print(f"Found {len(result_links)} result links")
 
-            valid_results = [r for r in results if r is not None]
-            valid_results.sort(key=lambda x: x.source_quality, reverse=True)
+                if not result_links:
+                    if attempt < retries - 1:
+                        print("No results found, retrying...")
+                        await asyncio.sleep(2)
+                        continue
+                    return []
 
-            print(f"Successfully processed {len(valid_results)} valid results")
-            return valid_results[:num_results]
+                tasks = [self.crawl_url(url) for url in result_links]
+                results = await asyncio.gather(*tasks)
 
-        except Exception as e:
-            print(f"Search error: {str(e)}")
-            print(f"Full exception: {repr(e)}")
-            return []
+                valid_results = [r for r in results if r is not None]
+                valid_results.sort(key=lambda x: x.source_quality, reverse=True)
+
+                print(f"Successfully processed {len(valid_results)} valid results")
+                return valid_results[:num_results]
+
+            except asyncio.TimeoutError:
+                print(f"Search timeout on attempt {attempt + 1}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return []
+
+            except Exception as e:
+                print(f"Search error on attempt {attempt + 1}: {str(e)}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return []
+
+        return []
 
     async def close(self):
         """Close the HTTP session."""
@@ -202,6 +255,7 @@ class EducationalLLMWrapper:
             f"Source: {result.url}\nTitle: {result.title}\nContent: {result.content}"
             for result in results
         ])
+        print("content of the web search:",content)
         return content
 
     async def _try_gemini_response(self, prompt: str) -> AsyncIterator[str]:
@@ -240,19 +294,25 @@ class EducationalLLMWrapper:
             education_level = EducationLevel.from_grade(grade)
 
             prompt = f"""
-            As a helpful teacher for grade {grade} students, answer the following question.
-            Adapt your response for:
-            - Reading level: {education_level.reading_level}
-            - Vocabulary level: {education_level.vocabulary_level}
-            - Explanation style: {education_level.explanation_style}
+            You are a knowledgeable and engaging teacher, responsible for explaining concepts to grade {grade} students.
+            Your explanation should be tailored to meet the specific educational needs of these students by considering the following:
 
+            Reading Level: {education_level.reading_level}
+            Vocabulary Level: {education_level.vocabulary_level}
+            Explanation Style: {education_level.explanation_style}
             Context:
             {context}
 
             Question:
             {query}
 
-            Provide an educational response appropriate for grade {grade}.
+            Your Task:
+            Provide a detailed, accurate, and engaging explanation of the topic that is clear and age-appropriate for grade {grade} students.
+            Make sure your response is long enough to thoroughly cover the topic, using simple language and relatable examples.
+            Incorporate real-life scenarios where possible to help students easily grasp the idea.
+            Focus on making the content engaging, clear, and easy to understand, ensuring that the students can fully comprehend the concept.
+
+
             """
 
             try:
