@@ -94,15 +94,27 @@ class DocumentationChat:
                 ])
 
             # Construct prompt with context
-            prompt = f"""Based on the following documentation context, answer the user's question.
-            If the context doesn't contain relevant information, say so.
+            #
+            if context=="": # If no relevant information found in the documentation
+                prompt = f"""Based on the following documentation context, answer the user's question.
+                If the context doesn't contain relevant information, say so.
 
-            Context:
-            {context}
+                Context:
+                {context}
 
-            User Question: {user_input}
+                User Question: {user_input}
 
-            Please provide a clear, detailed answer focusing on the specific information from the documentation. and if in case you don't find any relevant information, find in from your expertise as your will be working as a Teacher and Mentor to Class 1 to 12 students provide them accurate information and guidance."""
+                Please provide a clear, detailed answer focusing on the specific information from the documentation. and if in case you don't find any relevant information, find in from your expertise as your will be working as a Teacher and Mentor to Class 1 to 12 students provide them accurate information and guidance."""
+            else:
+                prompt = f"""Based on the following documentation context, answer the user's question.
+                  If the context doesn't contain relevant information, say so.
+
+                  Context:
+                  {context}
+
+                  User Question: {user_input}
+
+                  Please provide a clear, detailed answer focusing on the specific information from the documentation. and if in case you don't find any relevant information, find in from your expertise as your will be working as a Teacher and Mentor to Class 1 to 12 students provide them accurate information and guidance."""
 
             # Stream response using Gemini
             async for chunk in self.gemini.send_message(prompt):

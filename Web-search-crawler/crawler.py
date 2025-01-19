@@ -1,214 +1,44 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, AsyncIterator, Literal
+from typing import List, Optional, AsyncIterator, Literal
 import asyncio
-import os
-import json
-from datetime import datetime
 import httpx
 import cohere
 import google.generativeai as genai
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from urllib.parse import urljoin, urlparse
-from numpy import conj
+from urllib.parse import urlparse
 import streamlit as st
 from streamlit_chat import message
 import time
-import nest_asyncio
-import ssl
+import logging
+from functools import lru_cache
+import os
+from datetime import datetime
+from googlesearch import search
+from pathlib import Path
+import json
+import aiofiles
+import hashlib
+import urllib3
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-nest_asyncio.apply()
+# Load environment variables
 load_dotenv()
 
-@dataclass
+@dataclass(frozen=True)
 class WebContent:
-    """Represents crawled web content."""
+    """Represents crawled web content with immutable fields."""
     title: str | None
     content: str | None
     url: str | None
     source_quality: float | None
+    timestamp: str | None
 
-class WebCrawler:
-    """Handles web crawling functionality with educational focus."""
-
-    def __init__(self):
-        print("Initializing WebCrawler")
-        # Educational domains to prioritize
-        self.trusted_domains = {
-            'wikipedia.org': 0.8,
-            'britannica.com': 0.9,
-            'khanacademy.org': 0.95,
-            'nasa.gov': 0.9,
-            'nationalgeographic.com': 0.85,
-            'sciencedaily.com': 0.8,
-            'education.com': 0.75,
-            'scholastic.com': 0.85,
-        }
-        # Create a custom SSL context
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-        # Increased timeout and added retry configuration
-        self.session = httpx.AsyncClient(
-            timeout=30.0,  # Increased timeout
-            follow_redirects=True,
-            verify=ssl_context,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-            },
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        )
-        print(f"Initialized with {len(self.trusted_domains)} trusted domains")
-
-    def get_domain_score(self, url: str) -> float:
-        """Calculate domain reliability score."""
-        domain = urlparse(url).netloc.lower()
-        base_domain = '.'.join(domain.split('.')[-2:])
-        return self.trusted_domains.get(base_domain, 0.5)
-
-    async def clean_text(self, soup: BeautifulSoup) -> str:
-        """Clean and extract relevant text from HTML."""
-        # Remove unwanted elements
-        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
-            tag.decompose()
-
-        # Extract text from paragraphs and headers
-        content = []
-        for elem in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'article']):
-            text = elem.get_text().strip()
-            if text and len(text) > 20:  # Filter out short snippets
-                content.append(text)
-
-        return '\n\n'.join(content)
-
-    async def crawl_url(self, url: str) -> Optional[WebContent]:
-        """Crawl a single URL and extract content."""
-        print(f"\nCrawling URL: {url}")
-        retries = 3
-
-        for attempt in range(retries):
-            try:
-                response = await asyncio.wait_for(
-                    self.session.get(url),
-                    timeout=30
-                )
-                response.raise_for_status()
-                print(f"Successfully fetched {url}")
-
-                soup = BeautifulSoup(response.text, 'html.parser')
-                title = soup.title.string if soup.title else url
-                content = await self.clean_text(soup)
-
-                if not content:
-                    print(f"No content found for {url}")
-                    return None
-
-                result = WebContent(
-                    title=title,
-                    content=content[:2000],  # Limit content length
-                    url=url,
-                    source_quality=self.get_domain_score(url)
-                )
-                print(f"Successfully extracted content from {url} (quality: {result.source_quality})")
-                return result
-
-            except asyncio.TimeoutError:
-                print(f"Timeout on attempt {attempt + 1} for {url}")
-                if attempt == retries - 1:
-                    print(f"All retries failed for {url}")
-                    return None
-                await asyncio.sleep(1)  # Wait before retrying
-
-            except Exception as e:
-                print(f"Error crawling {url} on attempt {attempt + 1}: {str(e)}")
-                if attempt == retries - 1:
-                    print(f"All retries failed for {url}")
-                    return None
-                await asyncio.sleep(1)
-
-    async def search(self, query: str, num_results: int = 3) -> List[WebContent]:
-        """Perform web search using DuckDuckGo and crawl results."""
-        print(f"\nStarting web search for query: {query}")
-
-        # Using a more reliable search URL format
-        search_url = (
-            "https://duckduckgo.com/html/?" +
-            f"q={query}+site:({'+OR+'.join(self.trusted_domains.keys())})" +
-            "&kl=us-en&kt=n"
-        )
-
-        retries = 3
-        for attempt in range(retries):
-            try:
-                print(f"Sending request to DuckDuckGo (attempt {attempt + 1})")
-                response = await asyncio.wait_for(
-                    self.session.get(
-                        search_url,
-                        headers={'Cache-Control': 'no-cache'}
-                    ),
-                    timeout=30
-                )
-                response.raise_for_status()
-                print("Successfully received search results")
-
-                soup = BeautifulSoup(response.text, 'html.parser')
-                result_links = []
-
-                # Updated selector for DuckDuckGo results
-                for result in soup.select('.result__url, .result__a'):
-                    url = result.get('href')
-                    if url:
-                        full_url = urljoin('https://', url)
-                        if any(domain in full_url for domain in self.trusted_domains):
-                            print(f"Found result URL: {full_url}")
-                            result_links.append(full_url)
-                    if len(result_links) >= num_results:
-                        break
-
-                print(f"Found {len(result_links)} result links")
-
-                if not result_links:
-                    if attempt < retries - 1:
-                        print("No results found, retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    return []
-
-                tasks = [self.crawl_url(url) for url in result_links]
-                results = await asyncio.gather(*tasks)
-
-                valid_results = [r for r in results if r is not None]
-                valid_results.sort(key=lambda x: x.source_quality, reverse=True)
-
-                print(f"Successfully processed {len(valid_results)} valid results")
-                return valid_results[:num_results]
-
-            except asyncio.TimeoutError:
-                print(f"Search timeout on attempt {attempt + 1}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                return []
-
-            except Exception as e:
-                print(f"Search error on attempt {attempt + 1}: {str(e)}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                return []
-
-        return []
-
-    async def close(self):
-        """Close the HTTP session."""
-        await self.session.aclose()
-
-@dataclass
+@dataclass(frozen=True)
 class EducationLevel:
     """Defines grade-specific parameters for content adaptation."""
     grade: int
@@ -217,6 +47,7 @@ class EducationLevel:
     explanation_style: Literal["storytelling", "conceptual", "technical"]
 
     @classmethod
+    @lru_cache(maxsize=12)
     def from_grade(cls, grade: int) -> "EducationLevel":
         if grade <= 4:
             return cls(grade, "basic", "simple", "storytelling")
@@ -225,117 +56,279 @@ class EducationLevel:
         else:
             return cls(grade, "advanced", "advanced", "technical")
 
-class EducationalLLMWrapper:
-    """Enhanced LLM wrapper with improved error handling."""
+class WebCrawler:
+    """Enhanced web crawler with caching and better content extraction."""
 
-    def __init__(self):
-        print("\nInitializing EducationalLLMWrapper")
+    def __init__(self, cache_dir: str = ".cache"):
+        self.trusted_domains = {
+            'wikipedia.org': 0.9,
+            'britannica.com': 0.9,
+            'khanacademy.org': 0.95,
+            'nasa.gov': 0.9,
+            'nationalgeographic.com': 0.85,
+            'sciencedaily.com': 0.8,
+            'education.com': 0.75,
+            'scholastic.com': 0.85,
+            'nature.com': 0.95,
+            'science.org': 0.95
+        }
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.http_client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            verify=False,  # Disable SSL verification
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        )
+        # Suppress only the specific InsecureRequestWarning
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    async def _cache_key(self, url: str) -> str:
+        """Generate cache key for URL."""
+        return hashlib.md5(url.encode()).hexdigest()
+
+    async def _get_from_cache(self, url: str) -> Optional[WebContent]:
+        """Retrieve content from cache if available."""
         try:
-            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            self.model = genai.GenerativeModel('gemini-pro')
-            print("Successfully initialized Gemini model")
+            cache_key = await self._cache_key(url)
+            cache_file = self.cache_dir / f"{cache_key}.json"
+            if cache_file.exists():
+                async with aiofiles.open(cache_file, 'r') as f:
+                    data = json.loads(await f.read())
+                    return WebContent(**data)
+        except Exception as e:
+            logger.error(f"Cache read error for {url}: {e}")
+        return None
 
-            self.cohere_client = cohere.Client(os.getenv("COHERE_API_KEY"))
-            print("Successfully initialized Cohere model")
+    async def _save_to_cache(self, content: WebContent) -> None:
+        """Save content to cache."""
+        try:
+            if content.url:
+                cache_key = await self._cache_key(content.url)
+                cache_file = self.cache_dir / f"{cache_key}.json"
+                async with aiofiles.open(cache_file, 'w') as f:
+                    await f.write(json.dumps(content.__dict__))
+        except Exception as e:
+            logger.error(f"Cache write error: {e}")
 
-            self.web_crawler = WebCrawler()
-            print("Successfully initialized WebCrawler")
+    async def _extract_markdown(self, html: str, url: str) -> str:
+        """Extract and format content as markdown."""
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+
+            # Remove unwanted elements
+            for elem in soup.find_all(['script', 'style', 'nav', 'footer', 'iframe']):
+                elem.decompose()
+
+            # Extract title
+            title = soup.title.string if soup.title else ''
+
+            # Extract main content
+            main_content = []
+            for tag in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
+                text = tag.get_text(strip=True)
+                if len(text) > 30:  # Filter out short fragments
+                    if tag.name.startswith('h'):
+                        main_content.append(f"\n### {text}\n")
+                    elif tag.name == 'li':
+                        main_content.append(f"- {text}")
+                    else:
+                        main_content.append(text)
+
+            formatted_content = "\n\n".join(main_content)
+            return f"# {title}\n\n{formatted_content}"
 
         except Exception as e:
-            print(f"Error initializing EducationalLLMWrapper: {str(e)}")
-            raise
+            logger.error(f"Markdown extraction error for {url}: {e}")
+            return ""
 
-    async def get_web_content(self, query: str) -> str:
-        """Get content from web crawling."""
-        results = await self.web_crawler.search(query)
+    def search_urls(self, query: str, num_results: int = 4) -> List[str]:
+        """Perform search and return relevant URLs."""
+        try:
+            search_results = []
+            for url in search(query, stop=num_results, pause=2.0):
+                domain = urlparse(url).netloc.lower()
+                if any(trusted in domain for trusted in self.trusted_domains):
+                    search_results.append(url)
+            return search_results[:num_results]
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            return []
+
+    def get_domain_score(self, url: str) -> float:
+        """Calculate domain reliability score."""
+        domain = urlparse(url).netloc.lower()
+        return next((score for trusted_domain, score in self.trusted_domains.items()
+                    if trusted_domain in domain), 0.5)
+
+    async def fetch_url(self, url: str, retries: int = 2) -> Optional[WebContent]:
+        """Fetch and parse content from a URL with retries and caching."""
+        try:
+            # Check cache first
+            if cached := await self._get_from_cache(url):
+                logger.info(f"Cache hit for {url}")
+                return cached
+
+            for attempt in range(retries + 1):
+                try:
+                    response = await self.http_client.get(url)
+                    response.raise_for_status()
+
+                    markdown_content = await self._extract_markdown(response.text, url)
+
+                    content = WebContent(
+                        title=BeautifulSoup(response.text, 'html.parser').title.string,
+                        content=markdown_content,
+                        url=url,
+                        source_quality=self.get_domain_score(url),
+                        timestamp=datetime.now().isoformat()
+                    )
+
+                    await self._save_to_cache(content)
+                    return content
+
+                except httpx.HTTPError as e:
+                    if attempt == retries:
+                        logger.error(f"Failed to fetch {url} after {retries} retries: {e}")
+                        break
+                    await asyncio.sleep(1 * (attempt + 1))
+
+        except Exception as e:
+            logger.error(f"Error processing {url}: {e}")
+
+        return None
+
+    async def crawl(self, query: str, num_results: int = 4) -> List[WebContent]:
+        """Perform parallel crawling of search results."""
+        urls = self.search_urls(query, num_results)
+        if not urls:
+            return []
+
+        tasks = [self.fetch_url(url) for url in urls]
+        results = await asyncio.gather(*tasks)
+
+        # Filter out None results and sort by source quality
+        valid_results = [r for r in results if r is not None and r.content]
+        valid_results.sort(key=lambda x: x.source_quality or 0, reverse=True)
+
+        return valid_results[:num_results]
+
+    async def search_and_extract(self, query: str, num_results: int = 4) -> str:
+        """Search, crawl, and format results into markdown context."""
+        results = await self.crawl(query, num_results)
         if not results:
             return ""
 
-        content = "\n\n".join([
-            f"Source: {result.url}\nTitle: {result.title}\nContent: {result.content}"
-            for result in results
-        ])
-        print("content of the web search:",content)
-        return content
+        context_parts = []
+        for result in results:
+            if result.content:
+                context_parts.append(
+                    f"Source: {result.url}\n"
+                    f"Quality Score: {result.source_quality}\n"
+                    f"---\n"
+                    f"{result.content}\n"
+                    f"---\n"
+                )
 
-    async def _try_gemini_response(self, prompt: str) -> AsyncIterator[str]:
-        """Attempt to get a response from Gemini."""
-        chat = self.model.start_chat(history=[])
+        return "\n\n".join(context_parts)
 
+    async def close(self):
+        """Clean up resources."""
+        await self.http_client.aclose()
+
+
+
+class EducationalLLMWrapper:
+    """Enhanced LLM wrapper with improved error handling and streaming."""
+
+    def __init__(self):
+        logger.info("Initializing EducationalLLMWrapper")
+        self._initialize_llms()
+        self.web_crawler = WebCrawler()
+
+    def _initialize_llms(self):
+        """Initialize LLM clients with error handling."""
         try:
-            response = chat.send_message(prompt)
-            if response.text:
-                yield response.text
+            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+            self.model = genai.GenerativeModel('gemini-pro')
+            self.cohere_client = cohere.Client(os.getenv("COHERE_API_KEY"))
         except Exception as e:
-            print(f"Gemini error: {str(e)}")
+            logger.error(f"Failed to initialize LLMs: {e}")
             raise
 
-    async def _try_cohere_response(self, prompt: str) -> str:
-        """Get a response from Cohere as backup."""
+    async def get_response(self, query: str, grade: int) -> AsyncIterator[str]:
+        """Get educational response with streaming support."""
         try:
-            response = await asyncio.to_thread(
-                self.cohere_client.generate,
-                prompt=prompt,
-                max_tokens=500,
-                temperature=0.7,
-                k=0,
-                stop_sequences=[],
-                return_likelihoods='NONE'
-            )
-            return response.generations[0].text
-        except Exception as e:
-            print(f"Cohere error: {str(e)}")
-            raise
-
-    async def generate_response(self, query: str, grade: int) -> AsyncIterator[str]:
-        """Generate educational response with fallback options."""
-        try:
-            context = await self.get_web_content(query)
+            context = await self.web_crawler.search_and_extract(query)
             education_level = EducationLevel.from_grade(grade)
-
-            prompt = f"""
-            You are a knowledgeable and engaging teacher, responsible for explaining concepts to grade {grade} students.
-            Your explanation should be tailored to meet the specific educational needs of these students by considering the following:
-
-            Reading Level: {education_level.reading_level}
-            Vocabulary Level: {education_level.vocabulary_level}
-            Explanation Style: {education_level.explanation_style}
-            Context:
-            {context}
-
-            Question:
-            {query}
-
-            Your Task:
-            Provide a detailed, accurate, and engaging explanation of the topic that is clear and age-appropriate for grade {grade} students.
-            Make sure your response is long enough to thoroughly cover the topic, using simple language and relatable examples.
-            Incorporate real-life scenarios where possible to help students easily grasp the idea.
-            Focus on making the content engaging, clear, and easy to understand, ensuring that the students can fully comprehend the concept.
-
-
-            """
+            prompt = self._create_educational_prompt(query, grade, education_level, context)
 
             try:
-                async for chunk in self._try_gemini_response(prompt):
-                    yield chunk
+                response = self.model.generate_content(prompt, stream=True)
+                for chunk in response:
+                    if chunk.text:
+                        yield chunk.text
             except Exception as e:
-                print("Falling back to Cohere")
+                logger.info(f"Falling back to Cohere due to: {e}")
                 try:
-                    backup_response = await self._try_cohere_response(prompt)
-                    yield backup_response
+                    response = self.cohere_client.generate(
+                        prompt=prompt,
+                        max_tokens=500,
+                        temperature=0.7
+                    )
+                    yield response.generations[0].text
                 except Exception as e:
-                    yield "I apologize, but I'm having trouble generating a response. Please try again."
-
+                    logger.error(f"Cohere error: {e}")
+                    yield "I apologize, but I'm having trouble generating a response."
         except Exception as e:
-            print(f"Error in generate_response: {str(e)}")
+            logger.error(f"Error getting response: {e}")
             yield "I apologize, but I encountered an error. Please try again."
+
+    def _create_educational_prompt(self, query: str, grade: int, education_level: EducationLevel, context: str) -> str:
+        """Create an optimized educational prompt."""
+        return f"""
+        You are an experienced CBSE teacher helping a grade {grade} student.
+
+        Student Profile:
+        - Grade Level: {grade} (CBSE curriculum)
+        """+f"""
+        Learning Parameters:
+        - Reading Level:
+          * Grade 1-5: Simple sentences, basic vocabulary
+          * Grade 6-8: Moderate complexity, expanding vocabulary
+          * Grade 9-12: Advanced concepts, subject-specific terminology
+        """+f"""
+        - Teaching Approach:
+          * Grade 1-5: Story-based, visual examples, interactive
+          * Grade 6-8: Real-world applications, guided discovery
+          * Grade 9-12: Analytical thinking, exam-oriented
+
+        Topic: {context}
+        Question: {query}
+        """+ f"""
+        Please provide:
+        1. A brief, engaging introduction (2-3 sentences)
+        2. Clear explanation using age-appropriate language
+        3. 1-2 relevant examples from daily life
+        4. Key points to remember (3-4 points)
+        5. A simple practice question
+
+        Keep responses:
+        - Grade 1-5: 150-200 words
+        - Grade 6-8: 200-300 words
+        - Grade 9-12: 300-400 words
+
+        Include CBSE curriculum-aligned content and board exam perspectives where relevant."""
 
     async def close(self):
         """Clean up resources."""
         await self.web_crawler.close()
 
 class StreamlitEducationalApp:
-    """Streamlit interface for the Educational LLM Wrapper."""
+    """Streamlit interface with improved async handling."""
 
     def __init__(self):
         self.llm = EducationalLLMWrapper()
@@ -344,14 +337,17 @@ class StreamlitEducationalApp:
         self.create_custom_theme()
 
     def setup_page_config(self):
-        try:
-            st.set_page_config(
-                page_title="Educational AI Assistant",
-                page_icon="📚",
-                layout="wide"
-            )
-        except:
-            pass
+        st.set_page_config(
+            page_title="Educational AI Assistant",
+            page_icon="📚",
+            layout="wide"
+        )
+
+    def initialize_session_state(self):
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        if "current_grade" not in st.session_state:
+            st.session_state.current_grade = 6
 
     def create_custom_theme(self):
         st.markdown("""
@@ -363,21 +359,18 @@ class StreamlitEducationalApp:
                 border-radius: 10px;
                 background-color: #4CAF50;
                 color: white;
+                transition: all 0.3s ease;
             }
             .stButton > button:hover {
                 background-color: #45a049;
+                transform: translateY(-2px);
             }
             .stMarkdown {
                 font-size: 16px;
+                line-height: 1.6;
             }
             </style>
         """, unsafe_allow_html=True)
-
-    def initialize_session_state(self):
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-        if "current_grade" not in st.session_state:
-            st.session_state.current_grade = 6
 
     def setup_sidebar(self):
         with st.sidebar:
@@ -418,27 +411,21 @@ class StreamlitEducationalApp:
             "timestamp": time.time()
         })
 
-        placeholder = st.empty()
-        full_response = ""
+        message_placeholder = st.empty()
+        full_response = []
 
-        try:
-            async for response in self.llm.generate_response(prompt, st.session_state.current_grade):
-                if response:
-                    full_response = response
-                    placeholder.markdown(full_response + "▌")
+        async for chunk in self.llm.get_response(prompt, st.session_state.current_grade):
+            full_response.append(chunk)
+            message_placeholder.markdown(''.join(full_response) + "▌")
 
-            placeholder.markdown(full_response)
+        full_response_text = ''.join(full_response)
+        message_placeholder.markdown(full_response_text)
 
-            if full_response:
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": full_response,
-                    "timestamp": time.time()
-                })
-
-        except Exception as e:
-            print(f"Error: {str(e)}")
-            placeholder.markdown("I apologize, but I encountered an error. Please try again.")
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": full_response_text,
+            "timestamp": time.time()
+        })
 
     def run(self):
         try:
@@ -446,24 +433,30 @@ class StreamlitEducationalApp:
             self.display_chat_interface()
 
             if prompt := st.chat_input("Ask me anything! I'm here to help you learn 🌟"):
-                message(prompt, is_user=True)
+                with st.chat_message("user"):
+                    st.markdown(prompt)
                 with st.chat_message("assistant"):
                     asyncio.run(self.process_user_input(prompt))
 
         except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
+            logger.error(f"Application error: {e}")
+            st.error("An error occurred. Please try again.")
 
         finally:
             if hasattr(self, 'llm'):
                 asyncio.run(self.llm.close())
 
 def main():
+    """Main entry point with proper error handling."""
     try:
+        if os.name == 'nt':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
         app = StreamlitEducationalApp()
         app.run()
     except Exception as e:
-        st.error("A fatal error occurred. Please check the logs and try again.")
-        print(f"Fatal error: {str(e)}")
+        logger.error(f"Fatal error: {e}")
+        st.error("A fatal error occurred. Please refresh the page and try again.")
 
 if __name__ == "__main__":
     main()
