@@ -57,9 +57,11 @@ class EducationLevel:
             return cls(grade, "advanced", "advanced", "technical")
 
 class WebCrawler:
-    """Enhanced web crawler with caching and better content extraction."""
+    """Enhanced web crawler with Google Custom Search Engine integration."""
 
     def __init__(self, cache_dir: str = ".cache"):
+        self.api_key = os.getenv("GOOGLE_API_KEY")
+        self.cse_id = os.getenv("GOOGLE_CSE_ID")
         self.trusted_domains = {
             'wikipedia.org': 0.9,
             'britannica.com': 0.9,
@@ -74,45 +76,47 @@ class WebCrawler:
         }
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        # Initialize HTTP client with optimized settings
         self.http_client = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
-            verify=False,  # Disable SSL verification
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
+            verify=False,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            headers=self.headers
         )
-        # Suppress only the specific InsecureRequestWarning
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    async def _cache_key(self, url: str) -> str:
-        """Generate cache key for URL."""
-        return hashlib.md5(url.encode()).hexdigest()
-
-    async def _get_from_cache(self, url: str) -> Optional[WebContent]:
-        """Retrieve content from cache if available."""
+    def search_urls(self, query: str, num_results: int = 4) -> List[str]:
+        """Get links from Google Custom Search Engine or fallback to googlesearch."""
         try:
-            cache_key = await self._cache_key(url)
-            cache_file = self.cache_dir / f"{cache_key}.json"
-            if cache_file.exists():
-                async with aiofiles.open(cache_file, 'r') as f:
-                    data = json.loads(await f.read())
-                    return WebContent(**data)
-        except Exception as e:
-            logger.error(f"Cache read error for {url}: {e}")
-        return None
+            # First try using Google Custom Search API if credentials are available
+            if self.api_key and self.cse_id:
+                search_url = "https://www.googleapis.com/customsearch/v1"
+                params = {
+                    'q': query,
+                    'cx': self.cse_id,
+                    'key': self.api_key,
+                    'num': num_results
+                }
+                response = httpx.get(search_url, params=params)
+                results = response.json()
+                if 'items' in results:
+                    return [item['link'] for item in results['items']]
 
-    async def _save_to_cache(self, content: WebContent) -> None:
-        """Save content to cache."""
-        try:
-            if content.url:
-                cache_key = await self._cache_key(content.url)
-                cache_file = self.cache_dir / f"{cache_key}.json"
-                async with aiofiles.open(cache_file, 'w') as f:
-                    await f.write(json.dumps(content.__dict__))
+            # Fallback to googlesearch library
+            logger.info("Falling back to googlesearch library")
+            search_results = []
+            for url in search(query, stop=num_results, pause=2.0):
+                domain = urlparse(url).netloc.lower()
+                if any(trusted in domain for trusted in self.trusted_domains):
+                    search_results.append(url)
+            return search_results[:num_results]
+
         except Exception as e:
-            logger.error(f"Cache write error: {e}")
+            logger.error(f"Search error: {e}")
+            return []
 
     async def _extract_markdown(self, html: str, url: str) -> str:
         """Extract and format content as markdown."""
@@ -120,67 +124,72 @@ class WebCrawler:
             soup = BeautifulSoup(html, 'html.parser')
 
             # Remove unwanted elements
-            for elem in soup.find_all(['script', 'style', 'nav', 'footer', 'iframe']):
+            for elem in soup.find_all(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe']):
                 elem.decompose()
 
-            # Extract title
+            content_parts = []
             title = soup.title.string if soup.title else ''
+            content_parts.append(f"# {title.strip()}\n")
 
-            # Extract main content
-            main_content = []
-            for tag in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
+            # Process main content elements
+            main_tags = ['article', 'main', 'div[role="main"]', '.main-content', '#content']
+            main_content = None
+            for selector in main_tags:
+                main_content = soup.select_one(selector)
+                if main_content:
+                    break
+
+            if not main_content:
+                main_content = soup
+
+            # Extract structured content
+            for tag in main_content.find_all(['h1', 'h2', 'h3', 'h4', 'p', 'ul', 'ol']):
                 text = tag.get_text(strip=True)
-                if len(text) > 30:  # Filter out short fragments
-                    if tag.name.startswith('h'):
-                        main_content.append(f"\n### {text}\n")
-                    elif tag.name == 'li':
-                        main_content.append(f"- {text}")
-                    else:
-                        main_content.append(text)
+                if not text:
+                    continue
 
-            formatted_content = "\n\n".join(main_content)
-            return f"# {title}\n\n{formatted_content}"
+                if tag.name.startswith('h'):
+                    level = int(tag.name[1])
+                    content_parts.append(f"\n{'#' * level} {text}\n")
+                elif tag.name == 'p' and len(text) > 30:
+                    content_parts.append(f"\n{text}\n")
+                elif tag.name in ['ul', 'ol']:
+                    items = []
+                    for li in tag.find_all('li', recursive=False):
+                        li_text = li.get_text(strip=True)
+                        if li_text:
+                            items.append(f"- {li_text}")
+                    if items:
+                        content_parts.append("\n" + "\n".join(items) + "\n")
+
+            formatted_content = "\n".join(content_parts)
+            return formatted_content.strip()
 
         except Exception as e:
             logger.error(f"Markdown extraction error for {url}: {e}")
             return ""
 
-    def search_urls(self, query: str, num_results: int = 4) -> List[str]:
-        """Perform search and return relevant URLs."""
-        try:
-            search_results = []
-            for url in search(query, stop=num_results, pause=2.0):
-                domain = urlparse(url).netloc.lower()
-                if any(trusted in domain for trusted in self.trusted_domains):
-                    search_results.append(url)
-            return search_results[:num_results]
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            return []
-
-    def get_domain_score(self, url: str) -> float:
-        """Calculate domain reliability score."""
-        domain = urlparse(url).netloc.lower()
-        return next((score for trusted_domain, score in self.trusted_domains.items()
-                    if trusted_domain in domain), 0.5)
-
     async def fetch_url(self, url: str, retries: int = 2) -> Optional[WebContent]:
-        """Fetch and parse content from a URL with retries and caching."""
+        """Fetch and parse content from a URL with improved error handling."""
         try:
             # Check cache first
             if cached := await self._get_from_cache(url):
                 logger.info(f"Cache hit for {url}")
                 return cached
 
-            for attempt in range(retries + 1):
+            for attempt in range(retries):
                 try:
                     response = await self.http_client.get(url)
                     response.raise_for_status()
 
+                    soup = BeautifulSoup(response.text, 'html.parser')
                     markdown_content = await self._extract_markdown(response.text, url)
 
+                    if not markdown_content:
+                        continue
+
                     content = WebContent(
-                        title=BeautifulSoup(response.text, 'html.parser').title.string,
+                        title=soup.title.string if soup.title else None,
                         content=markdown_content,
                         url=url,
                         source_quality=self.get_domain_score(url),
@@ -190,11 +199,16 @@ class WebCrawler:
                     await self._save_to_cache(content)
                     return content
 
-                except httpx.HTTPError as e:
-                    if attempt == retries:
-                        logger.error(f"Failed to fetch {url} after {retries} retries: {e}")
+                except httpx.TimeoutException:
+                    if attempt == retries - 1:
+                        logger.error(f"Timeout fetching {url} after {retries} retries")
                         break
-                    await asyncio.sleep(1 * (attempt + 1))
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    if attempt == retries - 1:
+                        logger.error(f"Error fetching {url}: {e}")
+                        break
+                    await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"Error processing {url}: {e}")
@@ -202,7 +216,7 @@ class WebCrawler:
         return None
 
     async def crawl(self, query: str, num_results: int = 4) -> List[WebContent]:
-        """Perform parallel crawling of search results."""
+        """Perform parallel crawling of search results with improved handling."""
         urls = self.search_urls(query, num_results)
         if not urls:
             return []
@@ -217,14 +231,14 @@ class WebCrawler:
         return valid_results[:num_results]
 
     async def search_and_extract(self, query: str, num_results: int = 4) -> str:
-        """Search, crawl, and format results into markdown context."""
+        """Search and extract content with parallel processing."""
         results = await self.crawl(query, num_results)
         if not results:
             return ""
 
         context_parts = []
         for result in results:
-            if result.content:
+            if result and result.content:
                 context_parts.append(
                     f"Source: {result.url}\n"
                     f"Quality Score: {result.source_quality}\n"
@@ -235,10 +249,40 @@ class WebCrawler:
 
         return "\n\n".join(context_parts)
 
+    # Helper methods
+    async def _cache_key(self, url: str) -> str:
+        return hashlib.md5(url.encode()).hexdigest()
+
+    async def _get_from_cache(self, url: str) -> Optional[WebContent]:
+        try:
+            cache_key = await self._cache_key(url)
+            cache_file = self.cache_dir / f"{cache_key}.json"
+            if cache_file.exists():
+                async with aiofiles.open(cache_file, 'r') as f:
+                    data = json.loads(await f.read())
+                    return WebContent(**data)
+        except Exception as e:
+            logger.error(f"Cache read error for {url}: {e}")
+        return None
+
+    async def _save_to_cache(self, content: WebContent) -> None:
+        try:
+            if content.url:
+                cache_key = await self._cache_key(content.url)
+                cache_file = self.cache_dir / f"{cache_key}.json"
+                async with aiofiles.open(cache_file, 'w') as f:
+                    await f.write(json.dumps(content.__dict__))
+        except Exception as e:
+            logger.error(f"Cache write error: {e}")
+
+    def get_domain_score(self, url: str) -> float:
+        domain = urlparse(url).netloc.lower()
+        return next((score for trusted_domain, score in self.trusted_domains.items()
+                    if trusted_domain in domain), 0.5)
+
     async def close(self):
         """Clean up resources."""
         await self.http_client.aclose()
-
 
 
 class EducationalLLMWrapper:
@@ -276,8 +320,8 @@ class EducationalLLMWrapper:
                 try:
                     response = self.cohere_client.generate(
                         prompt=prompt,
-                        max_tokens=500,
-                        temperature=0.7
+                        max_tokens=300,
+                        temperature=0.3
                     )
                     yield response.generations[0].text
                 except Exception as e:
@@ -287,63 +331,69 @@ class EducationalLLMWrapper:
             logger.error(f"Error getting response: {e}")
             yield "I apologize, but I encountered an error. Please try again."
 
-   def _create_educational_prompt(self, query: str, grade: int, education_level: EducationLevel, context: str) -> str:
-    return f"""You are an experienced CBSE teacher helping a Grade {grade} student understand a concept.
-        Remember to maintain strict focus on CBSE curriculum guidelines.
+    def _create_educational_prompt(self, query: str, grade: int, education_level: EducationLevel, context: str) -> str:
+        print("Creating educational prompt",context)
+        format_guidelines = (
+            '- Use simple words and short sentences\n- Include storytelling elements\n- Word limit: 150-200 words'
+            if grade <= 5 else
+            '- Use moderate vocabulary\n- Include real-world applications\n- Word limit: 200-300 words'
+            if grade <= 8 else
+            '- Use subject-specific terminology\n- Focus on analytical thinking\n- Word limit: 300-400 words'
+            )
 
-            STUDENT CONTEXT:
-            - Grade Level: {grade}
-            - Subject Area: {context}
-            - Question: {query}
+        return f'''
+                            You are an experienced CBSE teacher helping a Grade {grade} student understand a concept.
+                            Remember to maintain strict focus on CBSE curriculum guidelines.
 
-            RESPONSE STRUCTURE:
-            1. Title: Start with a clear, engaging title for the topic
+                            STUDENT CONTEXT:
+                            - Grade Level: {grade}
+                            - Subject Area: {context}
+                            - Question: {query}
 
-            2. Introduction (2-3 sentences):
-            - Hook the student's interest
-            - Connect to prior knowledge
-            - State what they will learn
+                            RESPONSE STRUCTURE:
+                            1. Title: Start with a clear, engaging title for the topic
 
-            3. Main Explanation:
-            - Break down complex concepts into simple parts
-            - Use bullet points for clarity
-            - Include visual descriptions where helpful
-            - Stay within grade-appropriate vocabulary
+                            2. Introduction (2-3 sentences):
+                            - Hook the student's interest
+                            - Connect to prior knowledge
+                            - State what they will learn
 
-            4. Real-World Application(if required then only):
-            - Provide exactly 2 relatable examples
-            - Use scenarios from daily life
-            - Connect to student's experiences
+                            3. Main Explanation:
+                            - Break down complex concepts into simple parts
+                            - Use bullet points for clarity
+                            - Include visual descriptions where helpful
+                            - Stay within grade-appropriate vocabulary
 
-            5. Key Points to Remember (exactly 3 points):
-            - Use simple, memorable language
-            - Focus on essential concepts
-            - Make it exam-relevant
+                            4. Real-World Application(if required then only):
+                            - Provide exactly 2 relatable examples
+                            - Use scenarios from daily life
+                            - Connect to student's experiences
 
-            6. Practice Question(if required then only):
-            - One grade-appropriate question
-            - Include step-by-step solution approach
-            - Match CBSE exam pattern
+                            5. Key Points to Remember (exactly 3 points):
+                            - Use simple, memorable language
+                            - Focus on essential concepts
+                            - Make it exam-relevant
 
-            FORMAT GUIDELINES:
-            Grade {grade} Specific Approach:
-            {
-                '1-5': '- Use simple words and short sentences\n- Include storytelling elements\n- Word limit: 150-200 words',
-                '6-8': '- Use moderate vocabulary\n- Include real-world applications\n- Word limit: 200-300 words',
-                '9-12': '- Use subject-specific terminology\n- Focus on analytical thinking\n- Word limit: 300-400 words'
-            }[
-                '1-5' if grade <= 5 else '6-8' if grade <= 8 else '9-12'
-            ]}
+                            6. Practice Question(if required then only):
+                            - One grade-appropriate question
+                            - Include step-by-step solution approach
+                            - Match CBSE exam pattern
 
-            IMPORTANT RULES:
-            1. Never exceed the word limit
-            2. Always maintain CBSE curriculum alignment
-            3. Use clear section headings
-            4. Keep language consistent with grade level
-            5. Focus only on the asked topic
-            6. Avoid tangential information
+                            FORMAT GUIDELINES:
+                            Grade {grade} Specific Approach:
+                            {format_guidelines}
 
-            Remember to present information in a visually structured format using proper spacing and bullet points for better readability."""
+                            IMPORTANT RULES:
+                            1. Never exceed the word limit
+                            2. Always maintain CBSE curriculum alignment
+                            3. Use clear section headings
+                            4. Keep language consistent with grade level
+                            5. Focus only on the asked topic
+                            6. Avoid tangential information
+
+                            Remember to present information in a visually structured format using proper spacing and bullet points for better readability.
+                            '''
+
 
 
     async def close(self):
